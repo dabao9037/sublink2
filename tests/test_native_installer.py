@@ -106,7 +106,9 @@ def test_release_permissions_are_normalized_without_making_source_executable(tmp
     source_file.write_text("value = 1\n", encoding="utf-8")
     source_file.chmod(0o600)
 
-    result = run_harness(f"normalize_release_permissions {str(release)!r}")
+    result = run_harness(
+        f"chown() {{ :; }}\nnormalize_release_permissions {str(release)!r}"
+    )
     assert result.returncode == 0, result.stderr
     assert stat.S_IMODE(release.stat().st_mode) == 0o755
     assert stat.S_IMODE((release / "venv").stat().st_mode) == 0o755
