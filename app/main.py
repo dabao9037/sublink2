@@ -8,7 +8,7 @@ import sqlite3
 import hashlib
 import hmac
 from io import BytesIO
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -40,8 +40,14 @@ if not APP_SECRET:
 if not ADMIN_PASSWORD:
     raise RuntimeError("ADMIN_PASSWORD is required")
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    yield
+
+
 fernet = Fernet(APP_SECRET.encode())
-app = FastAPI(title="节点转订阅", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="节点转订阅", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static", html=False), name="static")
 
 
@@ -76,11 +82,6 @@ def init_db() -> None:
             """
         )
         conn.commit()
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
 
 
 def session_token() -> str:
