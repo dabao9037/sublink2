@@ -9,7 +9,7 @@ SubLink2 是一个轻量、自托管的“多个节点转一个订阅”工具�
 
 ## 一键安装
 
-支持 Ubuntu 20.04+、Debian 11/12/13，使用 root 或 sudo：
+支持 Ubuntu 22.04+、Debian 11/12/13（Python 3.9-3.13），使用 root 或 sudo：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/dabao9037/sublink2/main/install.sh) install
