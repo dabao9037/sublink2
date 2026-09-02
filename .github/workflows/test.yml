@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt pytest==8.4.2
+      - run: PYTHONPATH=. pytest -q
+      - run: bash -n install.sh
+      - name: Native service contract
+        run: |
+          grep -Fq '/usr/local/bin/sub' install.sh
+          grep -Fq 'sublink2.service' install.sh
+          grep -Fq 'systemctl enable' install.sh
+      - name: Native HTTP smoke
+        run: |
+          APP_SECRET='yU0Nu5NptM9YvbIYI1Q2hk4SSABNbDiVjytk1Eg6jwo=' \
+          ADMIN_USER=admin ADMIN_PASSWORD=test-password DB_PATH="$RUNNER_TEMP/smoke.db" \
+          uvicorn app.main:app --host 127.0.0.1 --port 18096 >"$RUNNER_TEMP/uvicorn.log" 2>&1 &
+          pid=$!
+          trap 'kill $pid || true' EXIT
+          for i in {1..30}; do curl -fsS http://127.0.0.1:18096/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:18096/healthz | grep -Fq '"status":"ok"'
+          curl -fsS http://127.0.0.1:18096/login | grep -Fq '欢迎回来'
