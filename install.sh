@@ -100,8 +100,9 @@ load_config(){
 
 write_config(){
   local target="${1:-$CONFIG_FILE}"
-  umask 077
-  cat >"$target" <<EOF
+  (
+    umask 077
+    cat >"$target" <<EOF
 SUBLINK_HOST=${SUBLINK_HOST}
 SUBLINK_PORT=${SUBLINK_PORT}
 ADMIN_USER=${ADMIN_USER}
@@ -112,6 +113,7 @@ DOMAIN=${DOMAIN:-}
 DOMAIN_HTTPS=${DOMAIN_HTTPS:-0}
 DB_PATH=${DATA_DIR}/subscriptions.db
 EOF
+  )
   chown root:"$SERVICE_USER" "$target" 2>/dev/null || true
   chmod 0640 "$target"
 }
@@ -122,6 +124,8 @@ write_systemd_unit(){
 Description=SubLink2 native subscription service
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=30
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -159,11 +163,19 @@ systemd_enable_active(){
 }
 
 health_check(){
-  local host="${SUBLINK_HOST:-$DEFAULT_HOST}" port="${SUBLINK_PORT:-$DEFAULT_PORT}" i
+  local host="${SUBLINK_HOST:-$DEFAULT_HOST}" port="${SUBLINK_PORT:-$DEFAULT_PORT}" i active_state exec_status
   [ "$host" = "0.0.0.0" ] && host="127.0.0.1"
   [ "$host" = "::" ] && host="::1"
   for i in {1..30}; do
     curl -fsS --connect-timeout 2 --max-time 4 "http://${host}:${port}/healthz" 2>/dev/null | grep -q '"status":"ok"' && return 0
+    if command_exists systemctl; then
+      active_state="$(systemctl show "$SERVICE_NAME" -p ActiveState --value 2>/dev/null || true)"
+      exec_status="$(systemctl show "$SERVICE_NAME" -p ExecMainStatus --value 2>/dev/null || true)"
+      if [ "$active_state" = failed ] || [ "$exec_status" = 203 ] || systemctl is-failed --quiet "$SERVICE_NAME" 2>/dev/null; then
+        [ "$exec_status" != 203 ] || warn "systemd 无法执行 ExecStart（203/EXEC），已停止等待。"
+        return 1
+      fi
+    fi
     sleep 1
   done
   return 1
@@ -201,8 +213,55 @@ build_release(){
   )
   rm -f "$smoke_db"
   find "$release_dir" -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+  normalize_release_permissions "$release_dir"
+}
+
+normalize_release_permissions(){
+  local release_dir="$1"
   chown -R root:root "$release_dir"
-  chmod -R o-w "$release_dir"
+  # The release contains no secrets.  It must be traversable/readable by the
+  # dedicated service user, but never writable by it. Preserve only files that
+  # were already executable; do not turn source/data files into executables.
+  find "$release_dir" -type d -exec chmod 0755 {} +
+  find "$release_dir" -type f -perm /0111 -exec chmod 0755 {} +
+  find "$release_dir" -type f ! -perm /0111 -exec chmod 0644 {} +
+}
+
+run_as_service_user(){
+  if [ -x /usr/sbin/runuser ]; then
+    /usr/sbin/runuser -u "$SERVICE_USER" -- "$@"
+  elif command_exists runuser; then
+    runuser -u "$SERVICE_USER" -- "$@"
+  else
+    die "缺少 runuser，无法以 ${SERVICE_USER} 验证运行权限。"
+  fi
+}
+
+verify_release_for_service_user(){
+  local release_dir="$1" unit="sublink2-preflight-$$" service_group
+  service_group="$(id -gn "$SERVICE_USER")" || die "无法确定 ${SERVICE_USER} 的主组。"
+  [ -x "$release_dir/venv/bin/python" ] || die "venv Python 不可执行：$release_dir/venv/bin/python"
+  [ -x "$release_dir/venv/bin/uvicorn" ] || die "Uvicorn 不可执行：$release_dir/venv/bin/uvicorn"
+  if find "$release_dir" -xdev \( -type d -o -type f \) -perm /022 -print -quit | grep -q .; then
+    die "release 包含可被非 root 用户写入的文件或目录。"
+  fi
+  run_as_service_user "$release_dir/venv/bin/python" -c 'import sys; print(sys.executable)' >/dev/null || \
+    die "专用用户无法遍历/执行 venv Python。"
+  run_as_service_user "$release_dir/venv/bin/uvicorn" --version >/dev/null || \
+    die "专用用户无法执行 Uvicorn；请检查完整权限链与 shebang。"
+
+  # On a real systemd host, also validate ExecStart under the same hardening
+  # properties before switching current, so 203/EXEC never enters a restart loop.
+  if command_exists systemd-run && [ -d /run/systemd/system ]; then
+    systemd-run --quiet --wait --collect --unit="$unit" --service-type=exec \
+      -p "User=${SERVICE_USER}" -p "Group=${service_group}" \
+      -p "WorkingDirectory=${release_dir}" -p NoNewPrivileges=yes \
+      -p PrivateTmp=yes -p PrivateDevices=yes -p ProtectSystem=strict \
+      -p ProtectHome=yes -p "ReadWritePaths=${DATA_DIR}" \
+      -p RestrictSUIDSGID=yes -p LockPersonality=yes -- \
+      "$release_dir/venv/bin/uvicorn" --version >/dev/null || \
+      die "systemd 沙箱预检无法以 ${SERVICE_USER} 执行 Uvicorn；尚未切换当前版本。"
+  fi
 }
 
 install_command(){
@@ -212,7 +271,10 @@ install_command(){
 
 atomic_activate(){
   local release_dir="$1" old_target="" next_link="${CURRENT_LINK}.next"
-  [ ! -L "$CURRENT_LINK" ] || old_target="$(readlink -f "$CURRENT_LINK")"
+  if [ -L "$CURRENT_LINK" ]; then
+    old_target="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
+    [ -d "$old_target" ] || old_target=""
+  fi
   ln -sfn "$release_dir" "$next_link"
   mv -Tf "$next_link" "$CURRENT_LINK"
   systemctl daemon-reload
@@ -461,10 +523,15 @@ install_app(){
   install_packages
   check_python
   ensure_service_user
+  if command_exists systemctl && systemctl is-failed --quiet "$SERVICE_NAME" 2>/dev/null; then
+    warn "检测到上次安装遗留的失败服务，先停止重启循环再构建新版本。"
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+  fi
   local release_id release_dir config_backup="" had_config=0
   release_id="$(date -u +%Y%m%d%H%M%S)-$(random_string 6)"
   release_dir="$RELEASES_DIR/$release_id"
-  mkdir -p "$release_dir"
+  install -d -o root -g root -m 0755 "$release_dir"
   if [ -f "$CONFIG_FILE" ]; then
     had_config=1
     load_config
@@ -489,6 +556,7 @@ install_app(){
     die "新版本构建失败，当前运行版本未改变。"
   fi
   write_config
+  verify_release_for_service_user "$release_dir"
   write_systemd_unit
   if ! atomic_activate "$release_dir"; then
     rm -rf "$release_dir"

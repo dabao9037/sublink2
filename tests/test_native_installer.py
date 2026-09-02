@@ -1,6 +1,12 @@
+import os
+import pwd
 import re
+import shlex
+import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +52,8 @@ def test_short_command_service_and_autostart_contract():
     assert 'User=${SERVICE_USER}' in text
     assert 'NoNewPrivileges=true' in text
     assert 'ProtectSystem=strict' in text
+    assert 'StartLimitIntervalSec=30' in text
+    assert 'StartLimitBurst=3' in text
 
 
 def test_persistent_paths_and_config_keys():
@@ -58,12 +66,132 @@ def test_persistent_paths_and_config_keys():
     assert "检测到已有安装：数据库、账号、APP_SECRET、端口和域名设置将全部保留" in text
 
 
+def test_write_config_does_not_leak_private_umask(tmp_path):
+    config = tmp_path / "config.env"
+    result = run_harness(
+        rf'''
+CONFIG_FILE={shlex.quote(str(config))}
+SERVICE_USER=nobody
+DATA_DIR={shlex.quote(str(tmp_path / "data"))}
+SUBLINK_HOST=127.0.0.1
+SUBLINK_PORT=8096
+ADMIN_USER=admin
+ADMIN_PASSWORD=test-password
+APP_SECRET=test-secret
+PUBLIC_BASE_URL=
+DOMAIN=
+DOMAIN_HTTPS=0
+umask 0022
+before="$(umask)"
+write_config
+printf 'before=%s after=%s\n' "$before" "$(umask)"
+'''
+    )
+    assert result.returncode == 0, result.stderr
+    assert "before=0022 after=0022" in result.stdout
+    assert stat.S_IMODE(config.stat().st_mode) == 0o640
+
+
+def test_release_permissions_are_normalized_without_making_source_executable(tmp_path):
+    release = tmp_path / "release"
+    (release / "venv/bin").mkdir(parents=True, mode=0o700)
+    python = release / "venv/bin/python"
+    python.write_text("#!/bin/sh\nprintf ok\\n", encoding="utf-8")
+    python.chmod(0o700)
+    uvicorn = release / "venv/bin/uvicorn"
+    uvicorn.write_text("#!/bin/sh\nprintf uvicorn\\n", encoding="utf-8")
+    uvicorn.chmod(0o700)
+    source_file = release / "app/main.py"
+    source_file.parent.mkdir(mode=0o700)
+    source_file.write_text("value = 1\n", encoding="utf-8")
+    source_file.chmod(0o600)
+
+    result = run_harness(f"normalize_release_permissions {str(release)!r}")
+    assert result.returncode == 0, result.stderr
+    assert stat.S_IMODE(release.stat().st_mode) == 0o755
+    assert stat.S_IMODE((release / "venv").stat().st_mode) == 0o755
+    assert stat.S_IMODE((release / "venv/bin").stat().st_mode) == 0o755
+    assert stat.S_IMODE(python.stat().st_mode) == 0o755
+    assert stat.S_IMODE(uvicorn.stat().st_mode) == 0o755
+    assert stat.S_IMODE(source_file.stat().st_mode) == 0o644
+    assert not (source_file.stat().st_mode & 0o111)
+    assert not (source_file.stat().st_mode & 0o022)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires root to drop to nobody")
+def test_low_privilege_user_can_traverse_and_execute_normalized_release(tmp_path):
+    nobody = pwd.getpwnam("nobody")
+    release = tmp_path / "release"
+    (release / "venv/bin").mkdir(parents=True, mode=0o700)
+    python = release / "venv/bin/python"
+    python.write_text("#!/bin/sh\nprintf 'service-user-ok\\n'\n", encoding="utf-8")
+    python.chmod(0o700)
+    # pytest's private tmp parents are intentionally not traversable; normalize the
+    # complete synthetic install chain just as /opt/sublink2 is normalized.
+    for parent in (tmp_path, release, release / "venv", release / "venv/bin"):
+        parent.chmod(0o700)
+
+    with pytest.raises(PermissionError):
+        subprocess.run(
+            [str(python)], capture_output=True, text=True, check=False,
+            user=nobody.pw_uid, group=nobody.pw_gid,
+        )
+
+    result = run_harness(f"normalize_release_permissions {str(release)!r}")
+    assert result.returncode == 0, result.stderr
+    for parent in tmp_path.parents:
+        if parent == Path("/tmp"):
+            break
+        parent.chmod(0o755)
+    tmp_path.chmod(0o755)
+    after = subprocess.run(
+        [str(python)], capture_output=True, text=True, check=False,
+        user=nobody.pw_uid, group=nobody.pw_gid,
+    )
+    assert after.returncode == 0, after.stderr
+    assert after.stdout.strip() == "service-user-ok"
+
+
+def test_preflight_executes_python_and_uvicorn_as_service_user():
+    text = source()
+    body = text.split("verify_release_for_service_user(){", 1)[1].split(
+        "\ninstall_command(){", 1
+    )[0]
+    assert 'run_as_service_user "$release_dir/venv/bin/python" -c' in body
+    assert 'run_as_service_user "$release_dir/venv/bin/uvicorn" --version' in body
+    assert 'verify_release_for_service_user "$release_dir"' in text
+    install_app = text.split("install_app(){", 1)[1].split("\nchange_port(){", 1)[0]
+    assert install_app.index('verify_release_for_service_user "$release_dir"') < install_app.index(
+        'atomic_activate "$release_dir"'
+    )
+
+
+def test_health_check_exits_early_on_systemd_exec_failure():
+    text = source()
+    body = text.split("health_check(){", 1)[1].split("\nfetch_source(){", 1)[0]
+    assert "systemctl is-failed --quiet" in body
+    assert "ExecMainStatus" in body
+    assert "203" in body
+
+
+def test_failed_first_install_is_stopped_and_broken_current_is_not_a_rollback_target():
+    text = source()
+    body = text.split("install_app(){", 1)[1].split("\nchange_port(){", 1)[0]
+    assert 'systemctl is-failed --quiet "$SERVICE_NAME"' in body
+    assert 'systemctl stop "$SERVICE_NAME"' in body
+    assert 'systemctl reset-failed "$SERVICE_NAME"' in body
+    atomic = text.split("atomic_activate(){", 1)[1].split("\nprune_releases(){", 1)[0]
+    assert '[ -d "$old_target" ] || old_target=""' in atomic
+    assert 'systemctl disable --now "$SERVICE_NAME"' in atomic
+    assert 'rm -f "$CURRENT_LINK"' in atomic
+
+
 def test_update_builds_before_atomic_switch_and_rolls_back():
     text = source()
     build = text.index('build_release "$release_dir"')
     activate = text.index('atomic_activate "$release_dir"')
     assert build < activate
-    assert 'old_target="$(readlink -f "$CURRENT_LINK")"' in text
+    assert 'old_target="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"' in text
     assert '正在恢复上一版本' in text
     assert 'mv -Tf "$next_link" "$CURRENT_LINK"' in text
     assert 'health_check' in text
