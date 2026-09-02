@@ -26,13 +26,16 @@ install -d -o root -g root -m 0755 "$SMOKE_ROOT" "$SMOKE_ROOT/releases" "$RELEAS
 install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$DATA"
 cp -a "$SOURCE_DIR/app" "$SOURCE_DIR/requirements.txt" "$RELEASE/"
 
-# Reproduce the installer bug: write_config used to leak umask 0077, causing
-# python -m venv to create venv/ and venv/bin/ as root-only 0700.
+# Reproduce the observed failed release permission chain deterministically.
+# The installer leaked umask 0077 before python -m venv; system Python on the
+# affected host creates root-only venv directories. setup-python may use a
+# symlinked bin directory, so force the observed 0700 state in this fixture.
 umask 0077
 python3 -m venv "$RELEASE/venv"
 "$RELEASE/venv/bin/pip" install --disable-pip-version-check -q -r "$RELEASE/requirements.txt"
+chmod 0700 "$RELEASE/venv" "$RELEASE/venv/bin"
 
-before_mode="$(stat -c '%a' "$RELEASE/venv/bin")"
+before_mode="$(stat -Lc '%a' "$RELEASE/venv/bin")"
 [ "$before_mode" = 700 ] || { echo "expected red-capable 0700 venv/bin, got $before_mode" >&2; exit 1; }
 if /usr/sbin/runuser -u "$SERVICE_USER" -- "$RELEASE/venv/bin/python" -c 'print("unexpected")' >/dev/null 2>&1; then
   echo "low-privilege permission repro unexpectedly passed before normalization" >&2
